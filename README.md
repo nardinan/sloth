@@ -1,4 +1,4 @@
-# SLOTH
+![alt text](sloth.png "sloth")
 
 **sloth** is a small educational LLM written entirely from scratch in pure C, with no non-unix dependencies.
 
