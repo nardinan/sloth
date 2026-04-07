@@ -891,6 +891,8 @@ s_GPT_model *f_GPT_model_new(size_t context_length) {
 void f_GPT_model_gradient_zero(s_GPT_model *model) {
   f_matrix_zero(model->embedding_table[d_G]);
   f_matrix_zero(model->new_iteration_head[d_G]);
+  f_matrix_zero(model->final_normalization_weights->gamma_weights[d_G]);
+  f_matrix_zero(model->final_normalization_weights->beta_weights[d_G]);
   for (size_t index_layer = 0; index_layer < d_number_layers; ++index_layer)
     f_transformer_weights_gradient_zero(model->transformer_weights[index_layer]);
 }
