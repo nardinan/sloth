@@ -36,7 +36,7 @@
 #define d_assert(c)                                                                                                                                            \
   do {                                                                                                                                                         \
     if (!(c)) {                                                                                                                                                \
-      fprintf(stderr, "ABORT: condition '%s' failed\n", #c);                                                                                                   \
+      fprintf(stderr, "ABORT: condition '%s' failed (function %s, line %d)\n", #c, __FUNCTION__, __LINE__);                                                    \
       abort();                                                                                                                                                 \
     }                                                                                                                                                          \
   } while (0)
@@ -251,19 +251,17 @@ void f_matrix_multiply_transposed_with_matrix_add_into_host(t_matrix *host, t_ma
 #define d_token_usr 4 /* user block (beginning) */
 #define d_token_ast 5 /* assistant block (beginning) */
 #define d_token_offset 6
-size_t f_encode(const char *text, int *output_tokens, size_t output_length, bool beginning_of_sequence, bool end_of_sequence) {
+size_t f_encode(const char *text, int *output_tokens, size_t output_length) {
   size_t length_text = strlen(text), index_token = 0;
-  if ((beginning_of_sequence) && (index_token < output_length))
-    output_tokens[index_token++] = d_token_bos;
   /* we are going to shift the printable characters (> 32) to have a sequence of
    * valid tokens that goes from 0 (pad) to 100 ('~' - 32 + 6) and compact
    * everything */
-  for (size_t index_text = 0; (index_text < length_text) && (index_token < output_length); ++index_text, ++index_token) {
-    d_assert(isprint(text[index_text]));
-    output_tokens[index_token] = (text[index_text] - 32 /* first printable character */) + d_token_offset;
+  for (size_t index_text = 0; (index_text < length_text) && (index_token < output_length); ++index_text) {
+    if (isprint(text[index_text])) {
+      output_tokens[index_token] = (text[index_text] - 32 /* first printable character */) + d_token_offset;
+      ++index_token;
+    }
   }
-  if ((end_of_sequence) && (index_token < output_length))
-    output_tokens[index_token++] = d_token_eos;
   return index_token;
 }
 void f_decode(const int *tokens, size_t tokens_length, char *output_text, size_t output_length) {
@@ -923,23 +921,37 @@ t_matrix *f_GPT_model_forward_new(s_GPT_model *model, const int *tokens, size_t 
  * It is time now to compute the error of this final forward matrix. I'm going
  * to use basically the same concepts I've also used in the standard RNN and FNN
  */
-float f_cross_entropy_loss(t_matrix *model_forwarded_matrix, const int *targets, size_t length) {
+/* if masks is null, the logic is applied on everything, otherwise only on targets where masks[index_sqeuence] == 1 */
+float f_cross_entropy_loss(t_matrix *model_forwarded_matrix, const int *targets, const bool *masks, size_t length) {
   d_assert((f_matrix_rows(model_forwarded_matrix) >= length) && (f_matrix_columns(model_forwarded_matrix) == d_vocabulary_size));
   float sum_losses_in_time = 0;
-  for (size_t index_sequence = 0; index_sequence < length; ++index_sequence) {
-    f_vector_log_softmax((t_vector *) &(d_matrix_getCR(model_forwarded_matrix, 0, index_sequence)), d_vocabulary_size);
-    sum_losses_in_time += d_matrix_getCR(model_forwarded_matrix, targets[index_sequence], index_sequence);
-  }
-  return -(1 / (float) length) * sum_losses_in_time;
+  size_t active_targets = 0;
+  for (size_t index_sequence = 0; index_sequence < length; ++index_sequence)
+    if ((!masks) || (masks[index_sequence])) {
+      f_vector_log_softmax((t_vector *) &(d_matrix_getCR(model_forwarded_matrix, 0, index_sequence)), d_vocabulary_size);
+      sum_losses_in_time += d_matrix_getCR(model_forwarded_matrix, targets[index_sequence], index_sequence);
+      ++active_targets;
+    }
+  if (!active_targets)
+    active_targets = 1;
+  return -(1 / (float) active_targets) * sum_losses_in_time;
 }
 /* Let's compute the gradients of the loss directly in place */
-void f_cross_entropy_loss_backward(t_matrix *model_forwarded_matrix, const int *target, size_t length) {
+void f_cross_entropy_loss_backward(t_matrix *model_forwarded_matrix, const int *target, const bool *masks, size_t length) {
   d_assert((f_matrix_rows(model_forwarded_matrix) >= length) && (f_matrix_columns(model_forwarded_matrix) == d_vocabulary_size));
-  for (size_t index_sequence = 0; index_sequence < length; ++index_sequence)
-    for (size_t index_column = 0; index_column < d_vocabulary_size; ++index_column)
-      d_matrix_getCR(model_forwarded_matrix, index_column, index_sequence) = (expf(d_matrix_getCR(model_forwarded_matrix, index_column, index_sequence)) -
-                                                                                 ((target[index_sequence] == index_column) ? 1.0 : 0.0)) /
-          (float) length;
+  size_t active_targets = length;
+  if (masks) {
+    active_targets = 0;
+    for (size_t index_sequence = 0; index_sequence < length; ++index_sequence)
+      active_targets += masks[index_sequence];
+  }
+  if (active_targets > 0)
+    for (size_t index_sequence = 0; index_sequence < length; ++index_sequence)
+      if ((!masks) || (masks[index_sequence]))
+        for (size_t index_column = 0; index_column < d_vocabulary_size; ++index_column)
+          d_matrix_getCR(model_forwarded_matrix, index_column, index_sequence) = (expf(d_matrix_getCR(model_forwarded_matrix, index_column, index_sequence)) -
+                                                                                     ((target[index_sequence] == index_column) ? 1.0 : 0.0)) /
+              (float) active_targets;
 }
 /* we now compute the gradient WRT the weights, and then the gradient WRT the
  * input and we return it */
@@ -1484,8 +1496,8 @@ void f_adam_weight_update(s_GPT_model *model, s_GPT_optimizer_state *optimizer_s
   }
 }
 void f_GPT_model_backward_new(s_GPT_model *model, t_matrix *model_forwarded_matrix /* the output of the f_GPT_model_forward_new(), the logits matrix */,
-    const int *tokens, const int *target, size_t length) {
-  f_cross_entropy_loss_backward(model_forwarded_matrix, target, length);
+    const int *tokens, const int *target, const bool *masks, size_t length) {
+  f_cross_entropy_loss_backward(model_forwarded_matrix, target, masks, length);
   t_matrix *result = f_GPT_model_head_backward_new(model, model_forwarded_matrix, model->final_normalized_sequence);
   if (result) {
     t_matrix *layer_gradient = f_layer_normalization_backward_new(model->final_normalization_weights, result,
@@ -1741,6 +1753,85 @@ int f_checkpoint_load(s_GPT_model *model, s_GPT_optimizer_state *state, size_t *
   }
   return result;
 }
+#define d_supervised_fine_tuning_prefix_assistant 'A'
+#define d_supervised_fine_tuning_prefix_system 'S'
+#define d_supervised_fine_tuning_prefix_user 'U'
+size_t f_supervised_fine_tuning_load(const char *training_module, int **tokens, bool **masks) {
+  FILE *corpus_stream;
+  size_t result = 0;
+  if ((corpus_stream = fopen(training_module, "r"))) {
+    size_t corpus_length = 0;
+    fseek(corpus_stream, 0, SEEK_END);
+    corpus_length = (size_t) ftell(corpus_stream);
+    fseek(corpus_stream, 0, SEEK_SET);
+    if (((*tokens) = (int *) malloc(sizeof(int) * corpus_length)) && ((*masks) = (bool *) malloc(sizeof(bool) * corpus_length))) {
+      char *corpus_payload = NULL;
+      if ((corpus_payload = (char *) malloc(corpus_length + 1))) {
+        bool end_of_sequence = true;
+        char *start_block = corpus_payload, *end_block = NULL;
+        fread(corpus_payload, 1, corpus_length, corpus_stream);
+        corpus_payload[corpus_length] = 0;
+        while ((*start_block != 0) && (((end_block = strchr(start_block, '\n'))) || ((end_block = (start_block + strlen(start_block)))))) {
+          size_t length_block = (end_block - start_block) + 1;
+          if (length_block > 2) {
+            bool mask_active = false;
+            if (start_block[1] == ':') {
+              size_t written_tokens;
+              if (end_of_sequence) {
+                end_of_sequence = false;
+                (*masks)[result] = 0;
+                (*tokens)[result++] = d_token_bos;
+              }
+              switch (start_block[0]) {
+                case d_supervised_fine_tuning_prefix_assistant: {
+                  (*masks)[result] = 0;
+                  (*tokens)[result++] = d_token_ast;
+                  mask_active = true;
+                  break;
+                }
+                case d_supervised_fine_tuning_prefix_system: {
+                  (*masks)[result] = 0;
+                  (*tokens)[result++] = d_token_sys;
+                  break;
+                }
+                default: /* unrecognizable token, we're going to fall back to the user */
+                case d_supervised_fine_tuning_prefix_user: {
+                  (*masks)[result] = 0;
+                  (*tokens)[result++] = d_token_usr;
+                  break;
+                }
+              }
+              written_tokens = f_encode((start_block + 2), &((*tokens)[result]), (length_block - 2));
+              memset(&((*masks)[result]), (mask_active) ? 1 : 0, (sizeof(bool) * written_tokens));
+              result += written_tokens;
+            }
+          } else {
+            /* we want to avoid multiple d_token_eos to be one after the other */
+            if ((result > 0) && ((*tokens)[result - 1] != d_token_eos)) {
+              (*masks)[result] = 0;
+              (*tokens)[result++] = d_token_eos;
+            }
+            end_of_sequence = true;
+          }
+          start_block = end_block;
+          if (*start_block == '\n') /* jump to the next token */
+            ++start_block;
+        }
+        free(corpus_payload);
+      }
+    }
+    if (!result) {
+      if (*tokens)
+        free(*tokens);
+      if (*masks)
+        free(*masks);
+      *tokens = NULL;
+      *masks = NULL;
+    }
+    fclose(corpus_stream);
+  }
+  return result;
+}
 size_t f_get_best_token(t_matrix *logits, int *tokens, size_t length) {
   float best_value = d_matrix_getCR(logits, 0, (length - 1));
   size_t best_token_index = 0;
@@ -1849,11 +1940,128 @@ float f_token_accuracy_percentage(t_matrix *logits, const int *targets, size_t l
   }
   return ((float) matches / (float) length) * 100.0f;
 }
+#define d_top_k 40 /* only the top-k tokens by logit survive before sampling; 0 = keep all */
+#define d_top_p 0.9f /* keep the smallest set of tokens whose cumulative probability >= p; 1.0 = no cutoff */
+#define d_learning_rate 3e-4f /* size of each weight update step; too high = unstable training, too low = slow convergence */
+#define d_momentum_decay 0.9f /* how much of the previous gradient direction carries into the current step (Adam β1) */
+#define d_magnitude_decay 0.999f /* how much of the previous gradient magnitude history carries into the current step (Adam β2) */
+#define d_weight_decay 0.01f /* gently shrinks weights each step to discourage memorisation (L2 regularisation) */
+#define d_epsilon 1e-8f /* tiny floor added to the denominator to avoid division by zero when gradient magnitude is near zero */
+void f_run_pretraining(const char *corpus_path, const char *model_path, const size_t number_epochs) {
+  FILE *corpus_stream;
+  if ((corpus_stream = fopen(corpus_path, "r"))) {
+    size_t corpus_length = 0, total_steps_per_epoch = 0;
+    char *corpus_payload = NULL;
+    fseek(corpus_stream, 0, SEEK_END);
+    corpus_length = (size_t) ftell(corpus_stream);
+    fseek(corpus_stream, 0, SEEK_SET);
+    total_steps_per_epoch = (corpus_length / d_context);
+    if ((corpus_payload = (char *) malloc(corpus_length + 1))) { /* bleargh, everything goes in memory. Quite annoying, right? */
+      s_GPT_model *model = f_GPT_model_new(d_context);
+      s_GPT_optimizer_state *optimizer_state = f_GPT_optimizer_state_new();
+      t_matrix *model_forward = NULL;
+      size_t step = 1, residual_characters, starting_epoch = 0, starting_step = 0, starting_corpus_offset = 0;
+      int input_tokens[d_context], target_tokens[d_context];
+      fread(corpus_payload, 1, corpus_length, corpus_stream);
+      corpus_payload[corpus_length] = '\0';
+      if (f_checkpoint_load(model, optimizer_state, &step, model_path)) {
+        starting_epoch = ((step - 1) / total_steps_per_epoch);
+        starting_step = ((step - 1) % total_steps_per_epoch);
+        starting_corpus_offset = starting_step * d_context;
+        printf("resuming from checkpoint at step %zu (epoch %zu, step %zu)\n", step, (starting_epoch + 1), starting_step);
+      }
+      for (size_t index_epoch = starting_epoch; index_epoch < number_epochs; ++index_epoch) {
+        for (size_t index_corpus = starting_corpus_offset; (index_corpus < corpus_length) && ((residual_characters = (corpus_length - index_corpus)) > 2);
+            index_corpus += d_context) {
+          size_t chunk_size = d_context;
+          if (residual_characters < (d_context + 1))
+            chunk_size = (residual_characters - 1);
+          f_encode(&(corpus_payload[index_corpus]), input_tokens, chunk_size);
+          f_encode(&(corpus_payload[index_corpus + 1]), target_tokens, chunk_size);
+          f_GPT_model_gradient_zero(model);
+          if ((model_forward = f_GPT_model_forward_new(model, input_tokens, chunk_size))) {
+            float global_gradient_normal, loss = f_cross_entropy_loss(model_forward, target_tokens, NULL, chunk_size),
+                                          accuracy = f_token_accuracy_percentage(model_forward, target_tokens, chunk_size);
+            f_GPT_model_backward_new(model, model_forward, input_tokens, target_tokens, NULL, chunk_size);
+            global_gradient_normal = f_gradients_clip(model, 1.0);
+            printf("Epoch %zu/%zu (step %zu, per epoch %zu) | metrics: bits-per-character (BPC) %.01f | loss %.03f | perplexity %.02f | accuracy %.02f%% | "
+                   "gradient normal (training stability) %.02f\n",
+                (index_epoch + 1), number_epochs, step, total_steps_per_epoch,
+                /* bits per character */ (loss / logf(2.0)),
+                /* raw loss */ loss,
+                /* perplexity */ (expf(loss)),
+                /* accuracy */ accuracy,
+                /* gradient normal, tells the stability of the learning (near zero, we're not learning anymore) */ global_gradient_normal);
+            f_adam_weight_update(model, optimizer_state, d_learning_rate, d_momentum_decay, d_magnitude_decay, d_epsilon, d_weight_decay, step);
+            f_checkpoint_save(model, optimizer_state, step, model_path);
+            f_matrix_free(model_forward);
+            model_forward = NULL;
+          }
+          ++step;
+        }
+        starting_corpus_offset = 0;
+      }
+      f_GPT_optimizer_state_free(optimizer_state);
+      f_GPT_model_free(model);
+      free(corpus_payload);
+    }
+    fclose(corpus_stream);
+  } else
+    fprintf(stderr, "cannot load corpus '%s'\n", corpus_path);
+}
+void f_run_supervised_fine_tuning(const char *corpus_path, const char *source_model_path, const char *destination_model_path, const size_t number_epochs) {
+  int *supervised_fine_tuning_tokens = NULL;
+  bool *supervised_fine_tuning_masks = NULL;
+  size_t supervised_fine_tuning_length = f_supervised_fine_tuning_load(corpus_path, &supervised_fine_tuning_tokens, &supervised_fine_tuning_masks);
+  if (supervised_fine_tuning_length > 1) {
+    s_GPT_model *model = f_GPT_model_new(d_context);
+    s_GPT_optimizer_state *optimizer_state = f_GPT_optimizer_state_new();
+    t_matrix *model_forward = NULL;
+    int input_tokens[d_context], target_tokens[d_context];
+    bool chunk_mask[d_context];
+    size_t step;
+    if (f_checkpoint_load(model, optimizer_state, &step, source_model_path)) {
+      printf("loaded pre-trained model from '%s' at step %zu\n", source_model_path, step);
+      step = 1; /* we should always re-start from scratch as we cannot continue the fine-tuning. We're going to break the sys-usr-ast tokenization and the
+                   content is going to be useless */
+      for (size_t index_epoch = 0; index_epoch < number_epochs; ++index_epoch) {
+        for (size_t index_corpus = 0; (index_corpus + 1) < supervised_fine_tuning_length; index_corpus += d_context) {
+          size_t chunk_size = ((supervised_fine_tuning_length - index_corpus) > d_context) ? d_context : (supervised_fine_tuning_length - index_corpus - 1);
+          if (chunk_size == 0)
+            break;
+          for (size_t index_chunk = 0; index_chunk < chunk_size; ++index_chunk) {
+            input_tokens[index_chunk] = supervised_fine_tuning_tokens[index_corpus + index_chunk];
+            target_tokens[index_chunk] = supervised_fine_tuning_tokens[index_corpus + index_chunk + 1];
+            chunk_mask[index_chunk] = supervised_fine_tuning_masks[index_corpus + index_chunk + 1];
+          }
+          f_GPT_model_gradient_zero(model);
+          if ((model_forward = f_GPT_model_forward_new(model, input_tokens, chunk_size))) {
+            float global_gradient_normal, loss = f_cross_entropy_loss(model_forward, target_tokens, chunk_mask, chunk_size),
+                                          accuracy = f_token_accuracy_percentage(model_forward, target_tokens, chunk_size);
+            f_GPT_model_backward_new(model, model_forward, input_tokens, target_tokens, chunk_mask, chunk_size);
+            global_gradient_normal = f_gradients_clip(model, 1.0);
+            printf("SFT Epoch %zu/%zu (step %zu) | BPC %.02f | loss %.03f | perplexity %.02f | accuracy %.02f%% | grad norm %.02f\n", (index_epoch + 1),
+                number_epochs, step, (loss / logf(2.0f)), loss, expf(loss), accuracy, global_gradient_normal);
+            f_adam_weight_update(model, optimizer_state, (d_learning_rate * 0.1f), d_momentum_decay, d_magnitude_decay, d_epsilon, d_weight_decay, step);
+            f_checkpoint_save(model, optimizer_state, step, destination_model_path);
+            f_matrix_free(model_forward);
+          }
+          ++step;
+        }
+      }
+    }
+    f_GPT_optimizer_state_free(optimizer_state);
+    f_GPT_model_free(model);
+    free(supervised_fine_tuning_tokens);
+    free(supervised_fine_tuning_masks);
+  } else
+    fprintf(stderr, "cannot load corpus '%s'\n", corpus_path);
+}
 void f_generate_from_prompt(s_GPT_model *model, const char *prompt, size_t new_tokens, float temperature, size_t top_k, float top_p) {
   s_GPT_kv_cache *kv_cache = f_GPT_kv_cache_new();
   if (kv_cache) {
     int tokens[d_context] = {0};
-    size_t prompt_length = f_encode(prompt, tokens, d_context, false, false);
+    size_t prompt_length = f_encode(prompt, tokens, d_context);
     printf("prompt > %s\noutput > ", prompt);
     fflush(stdout);
     /* prefill: one full forward pass on the prompt fills internal_states with K and V */
@@ -1921,94 +2129,22 @@ void f_generate_from_prompt(s_GPT_model *model, const char *prompt, size_t new_t
   }
   f_GPT_kv_cache_free(kv_cache);
 }
-#define d_top_k 40 /* only the top-k tokens by logit survive before sampling */
-#define d_top_p 0.9f /* keep the smallest set of tokens whose cumulative probability >= p */
+
 /* all the parameters of the model, fine tuned. I've checked with Claude and it said that those might be optimal for my implementation */
-#define d_learning_rate 3e-4f /* size of each weight update step: if too high = unstable training, too low = slow convergence */
-#define d_momentum_decay 0.9f /* how much of the previous gradient direction carries into the current backpropagation step */
-#define d_magnitude_decay 0.999f /* how much of the previous gradient magnitude history carries into the current backpropagatin step */
-#define d_weight_decay 0.01f /* gently shrinks weights each step to discourage memorisation (L2 regularisation) */
-#define d_epsilon 1e-8f /* super small value added to the denominator to avoid division by zero when gradient magnitude is near zero */
-static void usage(const char *argument) {
-  fprintf(stderr, "usage:\n");
-  fprintf(stderr, "  %s t <corpus> <model> [epochs]\n", argument);
-  fprintf(stderr, "  %s r <model> \"prompt\" <temperature> <number of tokens>\n", argument);
-}
 int main(int argc, char *argv[]) {
-  if (argc < 2) {
-    usage(argv[0]);
-    return 1;
-  }
-  if ((argv[1][0] == 't') && (argc >= 4)) {
-    size_t number_epochs;
-    FILE *corpus_stream;
-    if ((argc < 5) || ((number_epochs = atoi(argv[4])) < 1))
-      number_epochs = 1;
-    if ((corpus_stream = fopen(argv[2], "r"))) {
-      size_t corpus_length = 0, total_steps_per_epoch = 0;
-      char *corpus_payload = NULL;
-      fseek(corpus_stream, 0, SEEK_END);
-      corpus_length = (size_t) ftell(corpus_stream);
-      fseek(corpus_stream, 0, SEEK_SET);
-      total_steps_per_epoch = (corpus_length / d_context);
-      if ((corpus_payload = (char *) malloc(corpus_length + 1))) { /* bleargh, everything goes in memory. Quite annoying, right? */
-        s_GPT_model *model = f_GPT_model_new(d_context);
-        s_GPT_optimizer_state *optimizer_state = f_GPT_optimizer_state_new();
-        t_matrix *model_forward = NULL;
-        size_t step = 1, residual_characters, starting_epoch = 0, starting_step = 0, starting_corpus_offset = 0;
-        int input_tokens[d_context], target_tokens[d_context];
-        fread(corpus_payload, 1, corpus_length, corpus_stream);
-        for (size_t index_corpus = 0; index_corpus < corpus_length; ++index_corpus)
-          if (!isprint(corpus_payload[index_corpus]))
-            corpus_payload[index_corpus] = ' ';
-        corpus_payload[corpus_length] = '\0';
-        if (f_checkpoint_load(model, optimizer_state, &step, argv[3])) {
-          starting_epoch = ((step - 1) / total_steps_per_epoch);
-          starting_step = ((step - 1) % total_steps_per_epoch);
-          starting_corpus_offset = starting_step * d_context;
-          printf("resuming from checkpoint at step %zu (epoch %zu, step %zu)\n", step, (starting_epoch + 1), starting_step);
-        }
-        for (size_t index_epoch = starting_epoch; index_epoch < number_epochs; ++index_epoch) {
-          for (size_t index_corpus = starting_corpus_offset; (index_corpus < corpus_length) && ((residual_characters = (corpus_length - index_corpus)) > 2);
-              index_corpus += d_context) {
-            size_t chunk_size = d_context;
-            if (residual_characters < (d_context + 1))
-              chunk_size = (residual_characters - 1);
-            f_encode(&(corpus_payload[index_corpus]), input_tokens, chunk_size, false, false);
-            f_encode(&(corpus_payload[index_corpus + 1]), target_tokens, chunk_size, false, false);
-            f_GPT_model_gradient_zero(model);
-            if ((model_forward = f_GPT_model_forward_new(model, input_tokens, chunk_size))) {
-              float global_gradient_normal, loss = f_cross_entropy_loss(model_forward, target_tokens, chunk_size),
-                                            accuracy = f_token_accuracy_percentage(model_forward, target_tokens, chunk_size);
-              f_GPT_model_backward_new(model, model_forward, input_tokens, target_tokens, chunk_size);
-              global_gradient_normal = f_gradients_clip(model, 1.0);
-              printf("Epoch %zu/%zu (step %zu, per epoch %zu) | metrics: bits-per-character (BPC) %.01f | loss %.03f | perplexity %.02f | accuracy %.02f%% | "
-                     "gradient normal (training stability) %.02f\n",
-                  (index_epoch + 1), number_epochs, step, total_steps_per_epoch,
-                  /* bits per character */ (loss / logf(2.0)),
-                  /* raw loss */ loss,
-                  /* perplexity */ (expf(loss)),
-                  /* accuracy */ accuracy,
-                  /* gradient normal, tells the stability of the learning (near zero, we're not learning anymore) */ global_gradient_normal);
-              f_adam_weight_update(model, optimizer_state, d_learning_rate, d_momentum_decay, d_magnitude_decay, d_epsilon, d_weight_decay, step);
-              f_checkpoint_save(model, optimizer_state, step, argv[3]);
-              f_matrix_free(model_forward);
-              model_forward = NULL;
-            }
-            ++step;
-          }
-          starting_corpus_offset = 0;
-        }
-        f_GPT_optimizer_state_free(optimizer_state);
-        f_GPT_model_free(model);
-        free(corpus_payload);
-      }
-      fclose(corpus_stream);
-    } else
-      fprintf(stderr, "cannot load corpus '%s'\n", argv[2]);
-  } else if ((argv[1][0] == 'r') && (argc >= 6)) {
+  if ((argc >= 4) && (argv[1][0] == 't')) {
+    size_t number_epochs = 1;
+    if (argc > 4)
+      number_epochs = atoi(argv[4]);
+    f_run_pretraining(argv[2], argv[3], number_epochs);
+  } else if ((argc >= 4) && (argv[1][0] == 'f')) {
+    size_t number_epochs = 1;
+    if (argc > 5)
+      number_epochs = atoi(argv[5]);
+    f_run_supervised_fine_tuning(argv[2], argv[3], argv[4], number_epochs);
+  } else if ((argc >= 6) && (argv[1][0] == 'r')) {
     size_t new_tokens = (size_t) atoi(argv[5]), step = 1;
-    float temperature = atoi(argv[4]);
+    float temperature = atof(argv[4]);
     s_GPT_model *model = f_GPT_model_new(d_context);
     s_GPT_optimizer_state *optimizer_state = f_GPT_optimizer_state_new();
     if (f_checkpoint_load(model, optimizer_state, &step, argv[2]))
@@ -2017,7 +2153,11 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "cannot load model: %s\n", argv[2]);
     f_GPT_optimizer_state_free(optimizer_state);
     f_GPT_model_free(model);
-  } else
-    usage(argv[0]);
+  } else {
+    fprintf(stderr, "usage:\n");
+    fprintf(stderr, "  %s t <corpus> <model> [epochs]\n", argv[0]);
+    fprintf(stderr, "  %s f <supervised_fine_tuning_data> <pretrained_model> <supervised_fine_tuning_model> [epochs]\n", argv[0]);
+    fprintf(stderr, "  %s r <model> \"prompt\" <temperature> <number of tokens>\n", argv[0]);
+  }
   return 0;
 }
