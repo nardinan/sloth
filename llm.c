@@ -946,12 +946,18 @@ void f_cross_entropy_loss_backward(t_matrix *model_forwarded_matrix, const int *
       active_targets += masks[index_sequence];
   }
   if (active_targets > 0)
-    for (size_t index_sequence = 0; index_sequence < length; ++index_sequence)
-      if ((!masks) || (masks[index_sequence]))
+    for (size_t index_sequence = 0; index_sequence < length; ++index_sequence) {
+      if ((!masks) || (masks[index_sequence])) {
         for (size_t index_column = 0; index_column < d_vocabulary_size; ++index_column)
           d_matrix_getCR(model_forwarded_matrix, index_column, index_sequence) = (expf(d_matrix_getCR(model_forwarded_matrix, index_column, index_sequence)) -
                                                                                      ((target[index_sequence] == index_column) ? 1.0 : 0.0)) /
               (float) active_targets;
+      } else {
+        /* of course, if we're not masked we should set everything to zero, JC! */
+        for (size_t index_column = 0; index_column < d_vocabulary_size; ++index_column)
+          d_matrix_getCR(model_forwarded_matrix, index_column, index_sequence) = 0;
+      }
+    }
 }
 /* we now compute the gradient WRT the weights, and then the gradient WRT the
  * input and we return it */
@@ -1645,7 +1651,10 @@ t_matrix *f_transformer_decode_step(s_kv_cache *cache, s_transformer_weights *we
 }
 void f_checkpoint_save(s_GPT_model *model, s_GPT_optimizer_state *state, size_t step, const char *path) {
   FILE *stream;
-  if ((stream = fopen(path, "w"))) {
+  char temporary_file_path[PATH_MAX];
+  /* temporary file first, then renamed */
+  snprintf(temporary_file_path, (PATH_MAX - 1), "%s.tmp", path);
+  if ((stream = fopen(temporary_file_path, "w"))) {
     fprintf(stream, "%x %zu ", 0xdeadbeef, step);
     /* model weights */
     f_matrix_write(stream, model->embedding_table[d_W]);
@@ -1693,8 +1702,10 @@ void f_checkpoint_save(s_GPT_model *model, s_GPT_optimizer_state *state, size_t 
       f_matrix_write(stream, state->final_normalization_state->beta_weights[index_moment]);
     }
     fclose(stream);
+    rename(temporary_file_path, path);
   }
 }
+/* pay attention: if state is NULL, we'll not going to be loading the optimizer (e.g. during SFT training) */
 int f_checkpoint_load(s_GPT_model *model, s_GPT_optimizer_state *state, size_t *step, const char *path) {
   int result = 0;
   unsigned int magic;
@@ -1725,29 +1736,30 @@ int f_checkpoint_load(s_GPT_model *model, s_GPT_optimizer_state *state, size_t *
       }
       f_matrix_read(stream, model->final_normalization_weights->gamma_weights[d_W]);
       f_matrix_read(stream, model->final_normalization_weights->beta_weights[d_W]);
-      /* optimizer state */
-      for (size_t index_moment = d_M; index_moment <= d_V; ++index_moment) {
-        f_matrix_read(stream, state->embedding_table[index_moment]);
-        f_matrix_read(stream, state->new_iteration_head[index_moment]);
-        for (size_t index_layer = 0; index_layer < d_number_layers; ++index_layer) {
-          f_matrix_read(stream, state->transformer_state[index_layer]->before_attention_state->gamma_weights[index_moment]);
-          f_matrix_read(stream, state->transformer_state[index_layer]->before_attention_state->beta_weights[index_moment]);
-          f_matrix_read(stream, state->transformer_state[index_layer]->before_feedforward_state->gamma_weights[index_moment]);
-          f_matrix_read(stream, state->transformer_state[index_layer]->before_feedforward_state->beta_weights[index_moment]);
-          for (size_t index_head = 0; index_head < d_number_heads; ++index_head) {
-            f_matrix_read(stream, state->transformer_state[index_layer]->attention_state->weight_query[index_head][index_moment]);
-            f_matrix_read(stream, state->transformer_state[index_layer]->attention_state->weight_key[index_head][index_moment]);
-            f_matrix_read(stream, state->transformer_state[index_layer]->attention_state->weight_value[index_head][index_moment]);
+      /* optimizer state (only if exists) */
+      if (state)
+        for (size_t index_moment = d_M; index_moment <= d_V; ++index_moment) {
+          f_matrix_read(stream, state->embedding_table[index_moment]);
+          f_matrix_read(stream, state->new_iteration_head[index_moment]);
+          for (size_t index_layer = 0; index_layer < d_number_layers; ++index_layer) {
+            f_matrix_read(stream, state->transformer_state[index_layer]->before_attention_state->gamma_weights[index_moment]);
+            f_matrix_read(stream, state->transformer_state[index_layer]->before_attention_state->beta_weights[index_moment]);
+            f_matrix_read(stream, state->transformer_state[index_layer]->before_feedforward_state->gamma_weights[index_moment]);
+            f_matrix_read(stream, state->transformer_state[index_layer]->before_feedforward_state->beta_weights[index_moment]);
+            for (size_t index_head = 0; index_head < d_number_heads; ++index_head) {
+              f_matrix_read(stream, state->transformer_state[index_layer]->attention_state->weight_query[index_head][index_moment]);
+              f_matrix_read(stream, state->transformer_state[index_layer]->attention_state->weight_key[index_head][index_moment]);
+              f_matrix_read(stream, state->transformer_state[index_layer]->attention_state->weight_value[index_head][index_moment]);
+            }
+            f_matrix_read(stream, state->transformer_state[index_layer]->attention_state->weight_output[index_moment]);
+            f_matrix_read(stream, state->transformer_state[index_layer]->feedforward_state->weight_hidden[index_moment]);
+            f_matrix_read(stream, state->transformer_state[index_layer]->feedforward_state->bias_hidden[index_moment]);
+            f_matrix_read(stream, state->transformer_state[index_layer]->feedforward_state->weight_output[index_moment]);
+            f_matrix_read(stream, state->transformer_state[index_layer]->feedforward_state->bias_output[index_moment]);
           }
-          f_matrix_read(stream, state->transformer_state[index_layer]->attention_state->weight_output[index_moment]);
-          f_matrix_read(stream, state->transformer_state[index_layer]->feedforward_state->weight_hidden[index_moment]);
-          f_matrix_read(stream, state->transformer_state[index_layer]->feedforward_state->bias_hidden[index_moment]);
-          f_matrix_read(stream, state->transformer_state[index_layer]->feedforward_state->weight_output[index_moment]);
-          f_matrix_read(stream, state->transformer_state[index_layer]->feedforward_state->bias_output[index_moment]);
+          f_matrix_read(stream, state->final_normalization_state->gamma_weights[index_moment]);
+          f_matrix_read(stream, state->final_normalization_state->beta_weights[index_moment]);
         }
-        f_matrix_read(stream, state->final_normalization_state->gamma_weights[index_moment]);
-        f_matrix_read(stream, state->final_normalization_state->beta_weights[index_moment]);
-      }
     }
     fclose(stream);
   }
@@ -1844,10 +1856,6 @@ size_t f_get_best_token(t_matrix *logits, int *tokens, size_t length) {
   }
   return best_token_index;
 }
-/* sample one token from the logit row at `position`.
- * temperature: divide logits before softmax (<=0 → greedy argmax).
- * top_k: keep only k highest-logit tokens before softmax (0 → all).
- * top_p: nucleus cutoff after softmax (>=1.0 → no cutoff). */
 size_t f_sample_token(t_matrix *logits, size_t position, float temperature, size_t top_k, float top_p) {
   float local[d_vocabulary_size];
   size_t result;
@@ -1940,8 +1948,10 @@ float f_token_accuracy_percentage(t_matrix *logits, const int *targets, size_t l
   }
   return ((float) matches / (float) length) * 100.0f;
 }
+/* these parameters have been fine-tuned by some random AI agent */
 #define d_top_k 40 /* only the top-k tokens by logit survive before sampling; 0 = keep all */
 #define d_top_p 0.9f /* keep the smallest set of tokens whose cumulative probability >= p; 1.0 = no cutoff */
+#define d_default_temperature 1.0f /* chat sampling temperature default; lower = more focused (risk of loops), higher = more creative */
 #define d_learning_rate 3e-4f /* size of each weight update step; too high = unstable training, too low = slow convergence */
 #define d_momentum_decay 0.9f /* how much of the previous gradient direction carries into the current step (Adam β1) */
 #define d_magnitude_decay 0.999f /* how much of the previous gradient magnitude history carries into the current step (Adam β2) */
@@ -2020,10 +2030,11 @@ void f_run_supervised_fine_tuning(const char *corpus_path, const char *source_mo
     int input_tokens[d_context], target_tokens[d_context];
     bool chunk_mask[d_context];
     size_t step;
-    if (f_checkpoint_load(model, optimizer_state, &step, source_model_path)) {
+    if (f_checkpoint_load(model, NULL, &step, source_model_path)) {
       printf("loaded pre-trained model from '%s' at step %zu\n", source_model_path, step);
-      step = 1; /* we should always re-start from scratch as we cannot continue the fine-tuning. We're going to break the sys-usr-ast tokenization and the
-                   content is going to be useless */
+      /* as the process is learning the format that has to use to communicate with the user, we cannot break the tokenization so we always have to start from
+       * scratch. Additionally, this step refers to the pre-training process, and not to the SFT: it doesn't make sense here. Let's re-start from 1 */
+      step = 1;
       for (size_t index_epoch = 0; index_epoch < number_epochs; ++index_epoch) {
         for (size_t index_corpus = 0; (index_corpus + 1) < supervised_fine_tuning_length; index_corpus += d_context) {
           size_t chunk_size = ((supervised_fine_tuning_length - index_corpus) > d_context) ? d_context : (supervised_fine_tuning_length - index_corpus - 1);
@@ -2040,9 +2051,17 @@ void f_run_supervised_fine_tuning(const char *corpus_path, const char *source_mo
                                           accuracy = f_token_accuracy_percentage(model_forward, target_tokens, chunk_size);
             f_GPT_model_backward_new(model, model_forward, input_tokens, target_tokens, chunk_mask, chunk_size);
             global_gradient_normal = f_gradients_clip(model, 1.0);
-            printf("SFT Epoch %zu/%zu (step %zu) | BPC %.02f | loss %.03f | perplexity %.02f | accuracy %.02f%% | grad norm %.02f\n", (index_epoch + 1),
-                number_epochs, step, (loss / logf(2.0f)), loss, expf(loss), accuracy, global_gradient_normal);
-            f_adam_weight_update(model, optimizer_state, (d_learning_rate * 0.1f), d_momentum_decay, d_magnitude_decay, d_epsilon, d_weight_decay, step);
+            printf("Epoch %zu/%zu (step %zu) | metrics: bits-per-character (BPC) %.01f | loss %.03f | perplexity %.02f | accuracy %.02f%% | "
+                   "gradient normal (training stability) %.02f\n",
+                (index_epoch + 1), number_epochs, step,
+                /* bits per character */ (loss / logf(2.0)),
+                /* raw loss */ loss,
+                /* perplexity */ (expf(loss)),
+                /* accuracy */ accuracy,
+                /* gradient normal, tells the stability of the learning (near zero, we're not learning anymore) */ global_gradient_normal);
+            f_adam_weight_update(model, optimizer_state,
+                (d_learning_rate * 0.1f /* we're learning much slower, as we don't want to break the existing model */), d_momentum_decay, d_magnitude_decay,
+                d_epsilon, d_weight_decay, step);
             f_checkpoint_save(model, optimizer_state, step, destination_model_path);
             f_matrix_free(model_forward);
           }
@@ -2057,80 +2076,6 @@ void f_run_supervised_fine_tuning(const char *corpus_path, const char *source_mo
   } else
     fprintf(stderr, "cannot load corpus '%s'\n", corpus_path);
 }
-void f_generate_from_prompt(s_GPT_model *model, const char *prompt, size_t new_tokens, float temperature, size_t top_k, float top_p) {
-  s_GPT_kv_cache *kv_cache = f_GPT_kv_cache_new();
-  if (kv_cache) {
-    int tokens[d_context] = {0};
-    size_t prompt_length = f_encode(prompt, tokens, d_context);
-    printf("prompt > %s\noutput > ", prompt);
-    fflush(stdout);
-    /* prefill: one full forward pass on the prompt fills internal_states with K and V */
-    t_matrix *prefill_logits = f_GPT_model_forward_new(model, tokens, prompt_length);
-    if (prefill_logits) {
-      size_t token;
-      bool completed = false;
-      t_matrix *logits = NULL;
-      /* copy K/V from internal_states into the cache; set length for all layers */
-      for (size_t index_layer = 0; index_layer < d_number_layers; ++index_layer) {
-        for (size_t index_head = 0; index_head < d_number_heads; ++index_head) {
-          memcpy(kv_cache->cache[index_layer].key[index_head], model->internal_states[index_layer].key[index_head],
-              sizeof(float) * prompt_length * d_size_head);
-          memcpy(kv_cache->cache[index_layer].value[index_head], model->internal_states[index_layer].value[index_head],
-              sizeof(float) * prompt_length * d_size_head);
-        }
-        kv_cache->cache[index_layer].length = prompt_length;
-      }
-      /* the prefill logits at the last prompt position predict the first new token */
-      token = f_sample_token(prefill_logits, prompt_length - 1, temperature, top_k, top_p);
-      if ((!(completed = (token == (size_t) d_token_eos))) && (token >= (size_t) d_token_offset)) {
-        putchar((int) ((token - d_token_offset) + ' '));
-        fflush(stdout);
-      }
-      /* decode loop: each step embeds the last token and runs through the layers */
-      for (size_t index_step = 0; (!completed) && (index_step < (new_tokens - 1)) && (kv_cache->cache[0].length < d_context); ++index_step) {
-        float *token_row = NULL, *position_row = NULL;
-        size_t position = kv_cache->cache[0].length;
-        t_matrix *token_embedding = f_matrix_new(1, d_model);
-        if (token_embedding) {
-          t_matrix *current = NULL;
-          token_row = f_embedding_table_get_token(model->embedding_table[d_W], (int) token);
-          position_row = f_positional_encoding_table_get_position(model->positional_encoding_table, position);
-          for (size_t index_column = 0; index_column < d_model; ++index_column)
-            d_matrix_getCR(token_embedding, index_column, 0) = token_row[index_column] + position_row[index_column];
-          /* run through all transformer layers using the KV cache */
-          current = token_embedding;
-          for (size_t index_layer = 0; (current) && (index_layer < d_number_layers); ++index_layer) {
-            t_matrix *next_iteration = f_transformer_decode_step(&(kv_cache->cache[index_layer]), model->transformer_weights[index_layer], current);
-            f_matrix_free(current);
-            current = next_iteration;
-          }
-          if (current) {
-            t_matrix *normalized = f_layer_normalization_forward_new(model->final_normalization_weights, current);
-            if (normalized) {
-              if ((logits = f_matrix_multiply(logits, normalized, model->new_iteration_head[d_W]))) {
-                /* logits are [1 x vocab_size] — argmax at row 0 */
-                if ((token = f_sample_token(logits, 0, temperature, top_k, top_p)) == (size_t) d_token_eos)
-                  completed = true;
-                else if (token >= (size_t) d_token_offset) {
-                  putchar((int) ((token - d_token_offset) + ' '));
-                  fflush(stdout);
-                }
-              }
-              f_matrix_free(normalized);
-            }
-            f_matrix_free(current);
-          }
-        } else
-          completed = true;
-      }
-      f_matrix_free(prefill_logits);
-    }
-    putchar('\n');
-  }
-  f_GPT_kv_cache_free(kv_cache);
-}
-
-/* all the parameters of the model, fine tuned. I've checked with Claude and it said that those might be optimal for my implementation */
 int main(int argc, char *argv[]) {
   if ((argc >= 4) && (argv[1][0] == 't')) {
     size_t number_epochs = 1;
@@ -2142,22 +2087,11 @@ int main(int argc, char *argv[]) {
     if (argc > 5)
       number_epochs = atoi(argv[5]);
     f_run_supervised_fine_tuning(argv[2], argv[3], argv[4], number_epochs);
-  } else if ((argc >= 6) && (argv[1][0] == 'r')) {
-    size_t new_tokens = (size_t) atoi(argv[5]), step = 1;
-    float temperature = atof(argv[4]);
-    s_GPT_model *model = f_GPT_model_new(d_context);
-    s_GPT_optimizer_state *optimizer_state = f_GPT_optimizer_state_new();
-    if (f_checkpoint_load(model, optimizer_state, &step, argv[2]))
-      f_generate_from_prompt(model, argv[3], new_tokens, temperature, d_top_k, d_top_p);
-    else
-      fprintf(stderr, "cannot load model: %s\n", argv[2]);
-    f_GPT_optimizer_state_free(optimizer_state);
-    f_GPT_model_free(model);
   } else {
     fprintf(stderr, "usage:\n");
     fprintf(stderr, "  %s t <corpus> <model> [epochs]\n", argv[0]);
     fprintf(stderr, "  %s f <supervised_fine_tuning_data> <pretrained_model> <supervised_fine_tuning_model> [epochs]\n", argv[0]);
-    fprintf(stderr, "  %s r <model> \"prompt\" <temperature> <number of tokens>\n", argv[0]);
+    fprintf(stderr, "  %s c <model> \"<system prompt>\" [temperature]\n", argv[0]);
   }
   return 0;
 }
