@@ -2093,6 +2093,128 @@ void f_run_supervised_fine_tuning(const char *corpus_path, const char *source_mo
   if (supervised_fine_tuning_masks)
     free(supervised_fine_tuning_masks);
 }
+void f_chat_generate_assistant_turn(s_GPT_model *model, int *tokens, size_t *length, float temperature) {
+  t_matrix *prefill_logits = f_GPT_model_forward_new(model, tokens, *length);
+  if (prefill_logits) {
+    s_GPT_kv_cache *kv_cache = f_GPT_kv_cache_new();
+    if (kv_cache) {
+      size_t token = 0;
+      bool continue_run = true;
+      t_matrix *logits = NULL;
+      for (size_t index_layer = 0; index_layer < d_number_layers; ++index_layer) {
+        for (size_t index_head = 0; index_head < d_number_heads; ++index_head) {
+          memcpy(kv_cache->cache[index_layer].key[index_head], model->internal_states[index_layer].key[index_head], sizeof(float) * (*length) * d_size_head);
+          memcpy(kv_cache->cache[index_layer].value[index_head], model->internal_states[index_layer].value[index_head],
+              sizeof(float) * (*length) * d_size_head);
+        }
+        kv_cache->cache[index_layer].length = *length;
+      }
+      /* first assistant token comes from the prefill logits at the last prompt position */
+      token = f_sample_token(prefill_logits, (*length) - 1, temperature, d_top_k, d_top_p);
+      while ((continue_run) && ((*length) < d_context)) {
+        continue_run = false;
+        if ((token != d_token_eos) && (token != d_token_usr) && (token != d_token_sys) && (token != d_token_bos) && (token != d_token_ast) &&
+            (token != d_token_pad)) {
+          /* any boundary/role token means the model considers the turn finished — DO NOT append it to the buffer (it is the caller's responsibility to append
+           * the proper special token)
+           */
+          tokens[(*length)++] = (int) token;
+          if (token >= (size_t) d_token_offset) {
+            putchar((int) ((token - d_token_offset) + 32));
+            fflush(stdout);
+          }
+          if ((*length) < d_context) {
+            /* one decode step: embed the last token, walk every layer using the cache */
+            size_t position = (*length) - 1;
+            t_matrix *token_embedding = f_matrix_new(1, d_model);
+            if (token_embedding) {
+              float *token_row = f_embedding_table_get_token(model->embedding_table[d_W], token),
+                    *position_row = f_positional_encoding_table_get_position(model->positional_encoding_table, position);
+              t_matrix *current = token_embedding;
+              for (size_t index_column = 0; index_column < d_model; ++index_column)
+                d_matrix_getCR(token_embedding, index_column, 0) = token_row[index_column] + position_row[index_column];
+              for (size_t index_layer = 0; (current) && (index_layer < d_number_layers); ++index_layer) {
+                t_matrix *next_iteration = f_transformer_decode_step(&(kv_cache->cache[index_layer]), model->transformer_weights[index_layer], current);
+                f_matrix_free(current);
+                current = next_iteration;
+              }
+              if (current) {
+                t_matrix *normalized = f_layer_normalization_forward_new(model->final_normalization_weights, current);
+                if (normalized) {
+                  if ((logits = f_matrix_multiply(logits, normalized, model->new_iteration_head[d_W]))) {
+                    token = f_sample_token(logits, 0, temperature, d_top_k, d_top_p); /* next token, replaces the old one */
+                    continue_run = true; /* we have a new token available! Let's move forward */
+                  }
+                  f_matrix_free(normalized);
+                }
+                f_matrix_free(current);
+              }
+            }
+          }
+        }
+      }
+      f_matrix_free(logits);
+      f_GPT_kv_cache_free(kv_cache);
+    }
+    f_matrix_free(prefill_logits);
+  }
+}
+#define d_length_prompt 256
+#define d_length_reply_size 32
+void f_run_chat(const char *model_path, const char *system_prompt, float temperature) {
+  s_GPT_model *model = f_GPT_model_new(d_context);
+  if (model) {
+    if (f_checkpoint_load(model, NULL, NULL, model_path)) {
+      int tokens[d_context] = {0};
+      size_t length = 0;
+      bool end_conversation = false;
+      char user_line[d_length_prompt];
+      /* seed the conversation exactly as the SFT format says: one <BOS>, one <SYS>, then the encoded system prompt text. From there, turns are delimited
+       * ONLY by <USR> and <AST> role tokens — no more <BOS>/<EOS> inside the conversation */
+      tokens[length++] = d_token_bos;
+      tokens[length++] = d_token_sys;
+      length += f_encode(system_prompt, &(tokens[length]), (d_context - length));
+      printf("chat ready (temperature %.2f) — type /q to exit\n", temperature);
+      while ((!end_conversation) && (length < (d_context - d_length_reply_size))) {
+        size_t user_length;
+        memset(user_line, 0, d_length_prompt);
+        printf("you  > ");
+        fflush(stdout);
+        fgets(user_line, (d_length_prompt - 1), stdin);
+        if ((user_length = strlen(user_line)) > 0) {
+          if (user_line[0] == '/') {
+            switch (user_line[1]) {
+              case 'q': {
+                end_conversation = true;
+                printf("Bye!\n");
+                break;
+              }
+              default: {
+                printf("Command unknown\n");
+                break;
+              }
+            }
+          } else {
+            if ((length + user_length + d_length_reply_size) < d_context) { /* let's check if we have enough space to handle the request and the reply */
+              tokens[length++] = d_token_usr;
+              length += f_encode(user_line, &tokens[length], d_context - length);
+              tokens[length++] = d_token_ast;
+              printf("sloth> ");
+              f_chat_generate_assistant_turn(model, tokens, &length, temperature);
+              putchar('\n');
+            } else {
+              fprintf(stderr, "Context window is full, chat ended\n");
+              end_conversation = true;
+            }
+          }
+        }
+      }
+    } else
+      fprintf(stderr, "cannot load model: %s\n", model_path);
+    f_GPT_model_free(model);
+  }
+}
+/* all the parameters of the model, fine tuned. I've checked with Claude and it said that those might be optimal for my implementation */
 int main(int argc, char *argv[]) {
   if ((argc >= 4) && (argv[1][0] == 't')) {
     size_t number_epochs = 1;
@@ -2104,6 +2226,11 @@ int main(int argc, char *argv[]) {
     if (argc > 5)
       number_epochs = atoi(argv[5]);
     f_run_supervised_fine_tuning(argv[2], argv[3], argv[4], number_epochs);
+  } else if ((argc >= 4) && (argv[1][0] == 'c')) {
+    float temperature = d_default_temperature;
+    if (argc > 4)
+      temperature = (float) atof(argv[4]);
+    f_run_chat(argv[2], argv[3], temperature);
   } else {
     fprintf(stderr, "usage:\n");
     fprintf(stderr, "  %s t <corpus> <model> [epochs]\n", argv[0]);
