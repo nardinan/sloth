@@ -22,6 +22,7 @@
  * SOFTWARE.
  */
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -1711,9 +1712,12 @@ int f_checkpoint_load(s_GPT_model *model, s_GPT_optimizer_state *state, size_t *
   unsigned int magic;
   FILE *stream;
   if ((stream = fopen(path, "r"))) {
-    fscanf(stream, "%x %zu ", &magic, step);
+    size_t step_reached;
+    fscanf(stream, "%x %zu ", &magic, &step_reached);
     if (magic == 0xdeadbeef) {
       result = 1;
+      if (step)
+        *step = step_reached;
       /* model weights */
       f_matrix_read(stream, model->embedding_table[d_W]);
       f_matrix_read(stream, model->positional_encoding_table);
@@ -1820,7 +1824,7 @@ size_t f_supervised_fine_tuning_load(const char *training_module, int **tokens, 
           } else {
             /* we want to avoid multiple d_token_eos to be one after the other */
             if ((result > 0) && ((*tokens)[result - 1] != d_token_eos)) {
-              (*masks)[result] = 0;
+              (*masks)[result] = 1;
               (*tokens)[result++] = d_token_eos;
             }
             end_of_sequence = true;
@@ -1948,10 +1952,9 @@ float f_token_accuracy_percentage(t_matrix *logits, const int *targets, size_t l
   }
   return ((float) matches / (float) length) * 100.0f;
 }
-/* these parameters have been fine-tuned by some random AI agent */
 #define d_top_k 40 /* only the top-k tokens by logit survive before sampling; 0 = keep all */
 #define d_top_p 0.9f /* keep the smallest set of tokens whose cumulative probability >= p; 1.0 = no cutoff */
-#define d_default_temperature 1.0f /* chat sampling temperature default; lower = more focused (risk of loops), higher = more creative */
+#define d_default_temperature 0.8f /* chat sampling temperature default; lower = more focused, higher = more creative */
 #define d_learning_rate 3e-4f /* size of each weight update step; too high = unstable training, too low = slow convergence */
 #define d_momentum_decay 0.9f /* how much of the previous gradient direction carries into the current step (Adam β1) */
 #define d_magnitude_decay 0.999f /* how much of the previous gradient magnitude history carries into the current step (Adam β2) */
@@ -2025,56 +2028,70 @@ void f_run_supervised_fine_tuning(const char *corpus_path, const char *source_mo
   size_t supervised_fine_tuning_length = f_supervised_fine_tuning_load(corpus_path, &supervised_fine_tuning_tokens, &supervised_fine_tuning_masks);
   if (supervised_fine_tuning_length > 1) {
     s_GPT_model *model = f_GPT_model_new(d_context);
-    s_GPT_optimizer_state *optimizer_state = f_GPT_optimizer_state_new();
-    t_matrix *model_forward = NULL;
-    int input_tokens[d_context], target_tokens[d_context];
-    bool chunk_mask[d_context];
-    size_t step;
-    if (f_checkpoint_load(model, NULL, &step, source_model_path)) {
-      printf("loaded pre-trained model from '%s' at step %zu\n", source_model_path, step);
-      /* as the process is learning the format that has to use to communicate with the user, we cannot break the tokenization so we always have to start from
-       * scratch. Additionally, this step refers to the pre-training process, and not to the SFT: it doesn't make sense here. Let's re-start from 1 */
-      step = 1;
-      for (size_t index_epoch = 0; index_epoch < number_epochs; ++index_epoch) {
-        for (size_t index_corpus = 0; (index_corpus + 1) < supervised_fine_tuning_length; index_corpus += d_context) {
-          size_t chunk_size = ((supervised_fine_tuning_length - index_corpus) > d_context) ? d_context : (supervised_fine_tuning_length - index_corpus - 1);
-          if (chunk_size == 0)
-            break;
-          for (size_t index_chunk = 0; index_chunk < chunk_size; ++index_chunk) {
-            input_tokens[index_chunk] = supervised_fine_tuning_tokens[index_corpus + index_chunk];
-            target_tokens[index_chunk] = supervised_fine_tuning_tokens[index_corpus + index_chunk + 1];
-            chunk_mask[index_chunk] = supervised_fine_tuning_masks[index_corpus + index_chunk + 1];
+    if (f_checkpoint_load(model, NULL, NULL, source_model_path)) {
+      s_GPT_optimizer_state *optimizer_state = f_GPT_optimizer_state_new();
+      t_matrix *model_forward = NULL;
+      int input_tokens[d_context], target_tokens[d_context];
+      bool chunk_mask[d_context];
+      size_t step = 1;
+      printf("loaded pre-trained model from '%s'\n", source_model_path);
+      for (size_t index_epoch = 0; index_epoch < number_epochs; ++index_epoch)
+        for (size_t index_corpus = 0; (index_corpus + 1) < supervised_fine_tuning_length;) {
+          /* find the end of this conversation: scan forward to <EOS> or end of stream */
+          size_t index_conversation_end = index_corpus, chunk_size;
+          while ((index_conversation_end < supervised_fine_tuning_length) && (supervised_fine_tuning_tokens[index_conversation_end] != d_token_eos))
+            ++index_conversation_end;
+          /* in case the conversation is empty, just d_token_eos or as single, useless token that doesn't terminate with d_token_eos, or bigger than d_context,
+           * we'll skip it
+           */
+          if (((chunk_size = (index_conversation_end - index_corpus)) > 0) && (chunk_size < d_context)) {
+            for (size_t index_chunk = 0; index_chunk < chunk_size; ++index_chunk) {
+              input_tokens[index_chunk] = supervised_fine_tuning_tokens[index_corpus + index_chunk];
+              target_tokens[index_chunk] = supervised_fine_tuning_tokens[index_corpus + index_chunk + 1];
+              chunk_mask[index_chunk] = supervised_fine_tuning_masks[index_corpus + index_chunk + 1];
+            }
+            /* now we check if the conversation ends with d_token_eos, otherwise we'll force it if we have enough space */
+            if (((chunk_size + 1) < d_context) && (target_tokens[(chunk_size - 1)] != d_token_eos)) {
+              input_tokens[chunk_size] = target_tokens[(chunk_size - 1)];
+              target_tokens[chunk_size] = d_token_eos;
+              chunk_mask[chunk_size] = true; /* the EOS is always training */
+              ++chunk_size;
+            }
+            /* if d_token_eos still doesn't exists, we're skipping the stack */
+            if (target_tokens[(chunk_size - 1)] == d_token_eos) {
+              f_GPT_model_gradient_zero(model);
+              if ((model_forward = f_GPT_model_forward_new(model, input_tokens, chunk_size))) {
+                float global_gradient_normal, loss = f_cross_entropy_loss(model_forward, target_tokens, chunk_mask, chunk_size),
+                                              accuracy = f_token_accuracy_percentage(model_forward, target_tokens, chunk_size);
+                f_GPT_model_backward_new(model, model_forward, input_tokens, target_tokens, chunk_mask, chunk_size);
+                global_gradient_normal = f_gradients_clip(model, 1.0);
+                printf("Epoch %zu/%zu (step %zu) | metrics: bits-per-character (BPC) %.01f | loss %.03f | perplexity %.02f | accuracy %.02f%% | "
+                       "gradient normal (training stability) %.02f\n",
+                    (index_epoch + 1), number_epochs, step,
+                    /* bits per character */ (loss / logf(2.0)),
+                    /* raw loss */ loss,
+                    /* perplexity */ (expf(loss)),
+                    /* accuracy */ accuracy,
+                    /* gradient normal, tells the stability of the learning (near zero, we're not learning anymore) */ global_gradient_normal);
+                f_adam_weight_update(model, optimizer_state,
+                    (d_learning_rate * 0.1f /* we're learning much slower, as we don't want to break the existing model */), d_momentum_decay,
+                    d_magnitude_decay, d_epsilon, d_weight_decay, step);
+                f_checkpoint_save(model, optimizer_state, step, destination_model_path);
+                f_matrix_free(model_forward);
+              }
+              ++step;
+            }
           }
-          f_GPT_model_gradient_zero(model);
-          if ((model_forward = f_GPT_model_forward_new(model, input_tokens, chunk_size))) {
-            float global_gradient_normal, loss = f_cross_entropy_loss(model_forward, target_tokens, chunk_mask, chunk_size),
-                                          accuracy = f_token_accuracy_percentage(model_forward, target_tokens, chunk_size);
-            f_GPT_model_backward_new(model, model_forward, input_tokens, target_tokens, chunk_mask, chunk_size);
-            global_gradient_normal = f_gradients_clip(model, 1.0);
-            printf("Epoch %zu/%zu (step %zu) | metrics: bits-per-character (BPC) %.01f | loss %.03f | perplexity %.02f | accuracy %.02f%% | "
-                   "gradient normal (training stability) %.02f\n",
-                (index_epoch + 1), number_epochs, step,
-                /* bits per character */ (loss / logf(2.0)),
-                /* raw loss */ loss,
-                /* perplexity */ (expf(loss)),
-                /* accuracy */ accuracy,
-                /* gradient normal, tells the stability of the learning (near zero, we're not learning anymore) */ global_gradient_normal);
-            f_adam_weight_update(model, optimizer_state,
-                (d_learning_rate * 0.1f /* we're learning much slower, as we don't want to break the existing model */), d_momentum_decay, d_magnitude_decay,
-                d_epsilon, d_weight_decay, step);
-            f_checkpoint_save(model, optimizer_state, step, destination_model_path);
-            f_matrix_free(model_forward);
-          }
-          ++step;
+          index_corpus = (index_conversation_end + 1); /* advance to next conversation */
         }
-      }
+      f_GPT_optimizer_state_free(optimizer_state);
     }
-    f_GPT_optimizer_state_free(optimizer_state);
     f_GPT_model_free(model);
+  }
+  if (supervised_fine_tuning_tokens)
     free(supervised_fine_tuning_tokens);
+  if (supervised_fine_tuning_masks)
     free(supervised_fine_tuning_masks);
-  } else
-    fprintf(stderr, "cannot load corpus '%s'\n", corpus_path);
 }
 int main(int argc, char *argv[]) {
   if ((argc >= 4) && (argv[1][0] == 't')) {
