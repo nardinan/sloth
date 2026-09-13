@@ -277,7 +277,7 @@ void f_decode(const int *tokens, size_t tokens_length, char *output_text, size_t
 }
 /* d_model HAS TO BE even, otherwise f_positional_encoding_table_new() is going
  * to crash (or no, which is even worse) */
-#define d_model 64 /* our amazing d_model size. I've seen that GPT2 small uses 768 but it will make something impossible to train with this crappy code */
+#define d_model 256 /* our amazing d_model size. I've seen that GPT2 small uses 768 but it will make something impossible to train with this crappy code */
 #define d_context 512 /* maximum sequence of tokens we can use to guess the next token */
 bool m_random_initialized = false;
 float f_random_float(void) {
@@ -343,7 +343,7 @@ t_matrix *f_embedded_sequence_new(t_matrix *embedding_table, t_matrix *positiona
     }
   return result;
 }
-#define d_number_heads 4
+#define d_number_heads 8
 /* we need a place where to store the intermediate results computed during the
  * feedforward process, to be sure that during the backpropagation we can obtain
  * those intermediates */
@@ -375,6 +375,8 @@ void f_transformer_internal_states_free(s_transformer_internal_states *internal_
 #define d_size_head (d_model / d_number_heads)
 #define d_W 0 /* weights */
 #define d_G 1 /* gradient */
+/* What we are doing is for a single layer of our transformer. We might need to go through d_number_layers of them */
+#define d_number_layers 8
 /* our attention is given by a d_number_head number of matrices that are going
  * to be used to tailor different kind of attentions that each token in the
  * sequence gives to another token. For instance, if I use the sentence "the fox
@@ -412,6 +414,10 @@ void f_attention_weights_free(s_attention_weights *attention_weights) {
 s_attention_weights *f_attention_weights_new(void) {
   s_attention_weights *result = (s_attention_weights *) malloc(sizeof(s_attention_weights));
   d_assert((d_model % d_number_heads) == 0);
+  if (result)
+    /* zero it first: if we bail out partway through the head loop below, the heads we never reached (and weight_output) must read back as NULL, since
+     * f_attention_weights_free() walks all d_number_heads plus weight_output unconditionally */
+    memset(result, 0, sizeof(s_attention_weights));
   for (size_t index_head = 0; (result) && (index_head < d_number_heads); ++index_head) {
     for (size_t index_matrix = 0; index_matrix < 2; ++index_matrix) {
       result->weight_query[index_head][index_matrix] = f_matrix_new(d_model, d_size_head);
@@ -433,9 +439,10 @@ s_attention_weights *f_attention_weights_new(void) {
   }
   if (result) {
     if ((result->weight_output[d_W] = f_matrix_new(d_model, d_model)) && (result->weight_output[d_G] = f_matrix_new(d_model, d_model))) {
+      const float residual_scale = 1.0f / sqrtf(2.0f * (float) d_number_layers);
       for (size_t index_row = 0; index_row < d_model; ++index_row)
         for (size_t index_column = 0; index_column < d_model; ++index_column)
-          d_matrix_getCR(result->weight_output[d_W], index_column, index_row) = f_random_float();
+          d_matrix_getCR(result->weight_output[d_W], index_column, index_row) = f_random_float() * residual_scale;
     } else {
       f_attention_weights_free(result);
       result = NULL;
@@ -598,6 +605,7 @@ s_feedforward_weights *f_feedforward_weights_new(void) {
     }
     if ((result->weight_hidden[d_W]) && (result->weight_hidden[d_G]) && (result->bias_hidden[d_W]) && (result->bias_hidden[d_G]) &&
         (result->weight_output[d_W]) && (result->weight_output[d_G]) && (result->bias_output[d_W]) && (result->bias_output[d_G])) {
+      const float residual_scale = 1.0f / sqrtf(2.0f * (float) d_number_layers);
       for (size_t index_column = 0; index_column < d_feedforward_size; ++index_column) {
         for (size_t index_row = 0; index_row < d_model; ++index_row)
           d_matrix_getCR(result->weight_hidden[d_W], index_column, index_row) = f_random_float();
@@ -605,7 +613,7 @@ s_feedforward_weights *f_feedforward_weights_new(void) {
       }
       for (size_t index_column = 0; index_column < d_model; ++index_column) {
         for (size_t index_row = 0; index_row < d_feedforward_size; ++index_row)
-          d_matrix_getCR(result->weight_output[d_W], index_column, index_row) = f_random_float();
+          d_matrix_getCR(result->weight_output[d_W], index_column, index_row) = f_random_float() * residual_scale;
         d_matrix_getCR(result->bias_output[d_W], index_column, 0) = 0;
       }
     } else {
@@ -747,7 +755,6 @@ t_matrix *f_layer_normalization_forward_new(s_layer_normalization_weights *weigh
  * now we need to put everything together: what we've seen so far is A SINGLE
  * layer of our transformer. We might need to go through d_number_layers of them
  */
-#define d_number_layers 4
 typedef struct s_transformer_weights {
   s_layer_normalization_weights *before_attention_weights, *before_feedforward_weights;
   s_attention_weights *attention_weights;
@@ -857,10 +864,9 @@ void f_GPT_model_free(s_GPT_model *model) {
 s_GPT_model *f_GPT_model_new(size_t context_length) {
   s_GPT_model *result = (s_GPT_model *) malloc(sizeof(s_GPT_model));
   if (result) {
-    /* we need to load the file */
-    memset(result->internal_states, 0, (sizeof(s_transformer_internal_states) * d_number_layers));
-    result->final_normalized_sequence = NULL;
-    result->embedded_sequence = NULL;
+    /* we need to load the file; zero everything first so that any pointer we don't get around to allocating below (an early failure, or a field we skip on
+     * purpose) is a safe NULL rather than malloc garbage, since f_GPT_model_free() walks every one of these fields unconditionally */
+    memset(result, 0, sizeof(s_GPT_model));
     result->embedding_table[d_W] = f_embedding_table_new();
     result->embedding_table[d_G] = f_matrix_new(d_vocabulary_size, d_model);
     result->positional_encoding_table = f_positional_encoding_table_new(context_length);
@@ -869,6 +875,11 @@ s_GPT_model *f_GPT_model_new(size_t context_length) {
       for (size_t index_row = 0; index_row < d_model; ++index_row)
         for (size_t index_column = 0; index_column < d_vocabulary_size; ++index_column)
           d_matrix_getCR(result->new_iteration_head[d_W], index_column, index_row) = f_random_float();
+    }
+    /* no point paying for d_number_layers worth of transformer weights (now a much bigger allocation with d_model/d_number_layers at 256/8) if something
+     * above already failed and we're just going to free it all again */
+    if ((result->embedding_table[d_W]) && (result->embedding_table[d_G]) && (result->new_iteration_head[d_W]) && (result->new_iteration_head[d_G]) &&
+        (result->positional_encoding_table)) {
       for (size_t index_layer = 0; index_layer < d_number_layers; ++index_layer)
         result->transformer_weights[index_layer] = f_transformer_weights_new();
       result->final_normalization_weights = f_layer_normalization_weights_new();
@@ -1192,6 +1203,10 @@ void f_attention_optimizer_state_free(s_attention_optimizer_state *state) {
 }
 s_attention_optimizer_state *f_attention_optimizer_state_new(void) {
   s_attention_optimizer_state *result = (s_attention_optimizer_state *) malloc(sizeof(s_attention_optimizer_state));
+  if (result)
+    /* same reasoning as f_attention_weights_new(): zero it first so an early bail leaves untouched heads (and weight_output) as a safe NULL, since
+     * f_attention_optimizer_state_free() walks all d_number_heads plus weight_output unconditionally */
+    memset(result, 0, sizeof(s_attention_optimizer_state));
   for (size_t index_head = 0; (result) && (index_head < d_number_heads); ++index_head) {
     for (size_t index_matrix = 0; index_matrix < 2; ++index_matrix) {
       result->weight_query[index_head][index_matrix] = f_matrix_new(d_model, d_size_head);
@@ -1311,6 +1326,9 @@ void f_GPT_optimizer_state_free(s_GPT_optimizer_state *state) {
 s_GPT_optimizer_state *f_GPT_optimizer_state_new(void) {
   s_GPT_optimizer_state *result = (s_GPT_optimizer_state *) malloc(sizeof(s_GPT_optimizer_state));
   if (result) {
+    /* zero it first: transformer_state[]/final_normalization_state are only filled in further down once the checks below pass, and f_GPT_optimizer_state_free()
+     * walks every layer and dereferences final_normalization_state unconditionally, so an untouched slot must read back as NULL rather than malloc garbage */
+    memset(result, 0, sizeof(s_GPT_optimizer_state));
     for (size_t index_matrix = 0; index_matrix < 2; ++index_matrix) {
       result->embedding_table[index_matrix] = f_matrix_new(d_vocabulary_size, d_model);
       result->new_iteration_head[index_matrix] = f_matrix_new(d_model, d_vocabulary_size);
@@ -1952,14 +1970,37 @@ float f_token_accuracy_percentage(t_matrix *logits, const int *targets, size_t l
   }
   return ((float) matches / (float) length) * 100.0f;
 }
-#define d_top_k 40 /* only the top-k tokens by logit survive before sampling; 0 = keep all */
-#define d_top_p 0.9f /* keep the smallest set of tokens whose cumulative probability >= p; 1.0 = no cutoff */
+#define d_top_k 20 /* only the top-k tokens by logit survive before sampling; 0 = keep all */
+#define d_top_p 0.85f /* keep the smallest set of tokens whose cumulative probability >= p; 1.0 = no cutoff */
 #define d_default_temperature 0.8f /* chat sampling temperature default; lower = more focused, higher = more creative */
 #define d_learning_rate 3e-4f /* size of each weight update step; too high = unstable training, too low = slow convergence */
 #define d_momentum_decay 0.9f /* how much of the previous gradient direction carries into the current step (Adam β1) */
 #define d_magnitude_decay 0.999f /* how much of the previous gradient magnitude history carries into the current step (Adam β2) */
 #define d_weight_decay 0.01f /* gently shrinks weights each step to discourage memorisation (L2 regularisation) */
 #define d_epsilon 1e-8f /* tiny floor added to the denominator to avoid division by zero when gradient magnitude is near zero */
+#define d_warmup_steps                                                                                                                                         \
+  5000 /* number of steps we're going to be using for the "warmup" session for the learning rate score. I know I've a ~20k steps per epoch and I'll be running \
+        * ~10 epochs. The total warmup shall be around 2.5% of the total steps */
+#define d_learning_rate_min_ratio 0.1f /* minimum learning rate ratio */
+#define d_iteration_save 50 /* after these iteration, we're re-dumping the model */
+float f_learning_rate_gradient(size_t step, size_t total_steps, size_t warmup_steps, float maximum_learning_rate, float minimum_ratio) {
+  float learning_rate;
+  /* if the configured warmup window doesn't fit inside this run (short corpus, few epochs), shrink it so we still climb to the peak learning rate and get
+   * some cosine decay before training ends, instead of spending the whole run stuck in linear warmup */
+  size_t effective_warmup_steps = (warmup_steps < total_steps) ? warmup_steps : (total_steps / 10);
+  if (step < effective_warmup_steps)
+    learning_rate = (maximum_learning_rate * ((float) step / (float) effective_warmup_steps));
+  else if (step >= total_steps) {
+    learning_rate = maximum_learning_rate * minimum_ratio;
+  } else {
+    float progress_percentage = (float) (step - effective_warmup_steps) / (float) (total_steps - effective_warmup_steps);
+    learning_rate = maximum_learning_rate * (minimum_ratio + ((1.0f - minimum_ratio) * (0.5f * (1.0f + cosf(3.14159265f * progress_percentage)))));
+  }
+  /* by using this apporach the larning rate is a weird hill: it starts from zero and linearily grows up to the maximum_learning_rate in the first 'warmup'
+   * steps, then it decays slowly, following the cosinus curve and going down for the rest of the training. By using this approach we're not going to be using a
+   * fixed value */
+  return learning_rate;
+}
 void f_run_pretraining(const char *corpus_path, const char *model_path, const size_t number_epochs) {
   FILE *corpus_stream;
   if ((corpus_stream = fopen(corpus_path, "r"))) {
@@ -1969,7 +2010,9 @@ void f_run_pretraining(const char *corpus_path, const char *model_path, const si
     corpus_length = (size_t) ftell(corpus_stream);
     fseek(corpus_stream, 0, SEEK_SET);
     total_steps_per_epoch = (corpus_length / d_context);
-    if ((corpus_payload = (char *) malloc(corpus_length + 1))) { /* bleargh, everything goes in memory. Quite annoying, right? */
+    if (!total_steps_per_epoch)
+      fprintf(stderr, "corpus '%s' is too short (%zu bytes) to fill a single %d-token context window\n", corpus_path, corpus_length, d_context);
+    else if ((corpus_payload = (char *) malloc(corpus_length + 1))) { /* bleargh, everything goes in memory. Quite annoying, right? */
       s_GPT_model *model = f_GPT_model_new(d_context);
       s_GPT_optimizer_state *optimizer_state = f_GPT_optimizer_state_new();
       t_matrix *model_forward = NULL;
@@ -1994,25 +2037,35 @@ void f_run_pretraining(const char *corpus_path, const char *model_path, const si
           f_GPT_model_gradient_zero(model);
           if ((model_forward = f_GPT_model_forward_new(model, input_tokens, chunk_size))) {
             float global_gradient_normal, loss = f_cross_entropy_loss(model_forward, target_tokens, NULL, chunk_size),
-                                          accuracy = f_token_accuracy_percentage(model_forward, target_tokens, chunk_size);
+                                          accuracy = f_token_accuracy_percentage(model_forward, target_tokens, chunk_size),
+                                          current_learning_rate = f_learning_rate_gradient(step, (total_steps_per_epoch * number_epochs), d_warmup_steps,
+                                              d_learning_rate, d_learning_rate_min_ratio);
             f_GPT_model_backward_new(model, model_forward, input_tokens, target_tokens, NULL, chunk_size);
             global_gradient_normal = f_gradients_clip(model, 1.0);
-            printf("Epoch %zu/%zu (step %zu, per epoch %zu) | metrics: bits-per-character (BPC) %.01f | loss %.03f | perplexity %.02f | accuracy %.02f%% | "
+            printf("Epoch %zu/%zu (step %zu, per epoch %zu) | metrics: learning rate %.06f | bits-per-character (BPC) %.01f | loss %.03f | perplexity %.02f | "
+                   "accuracy %.02f%% | "
                    "gradient normal (training stability) %.02f\n",
                 (index_epoch + 1), number_epochs, step, total_steps_per_epoch,
+                /* learning rate used */ current_learning_rate,
                 /* bits per character */ (loss / logf(2.0)),
                 /* raw loss */ loss,
                 /* perplexity */ (expf(loss)),
                 /* accuracy */ accuracy,
                 /* gradient normal, tells the stability of the learning (near zero, we're not learning anymore) */ global_gradient_normal);
-            f_adam_weight_update(model, optimizer_state, d_learning_rate, d_momentum_decay, d_magnitude_decay, d_epsilon, d_weight_decay, step);
-            f_checkpoint_save(model, optimizer_state, step, model_path);
+            f_adam_weight_update(model, optimizer_state, current_learning_rate, d_momentum_decay, d_magnitude_decay, d_epsilon, d_weight_decay, step);
+            /* the step counter only advances once the update above is actually applied: this keeps it a true count of applied Adam updates (used both by the
+             * learning rate schedule and the resume math below) instead of drifting whenever a chunk's forward pass fails to allocate */
+            ++step;
+            /* checkpoints always store the NEXT step to run (matching the unconditional end-of-epoch save below), so that resuming re-derives the position
+             * right after the last chunk that was actually processed, instead of redoing it */
+            if (((step - 1) % d_iteration_save) == 0)
+              f_checkpoint_save(model, optimizer_state, step, model_path);
             f_matrix_free(model_forward);
             model_forward = NULL;
           }
-          ++step;
         }
         starting_corpus_offset = 0;
+        f_checkpoint_save(model, optimizer_state, step, model_path);
       }
       f_GPT_optimizer_state_free(optimizer_state);
       f_GPT_model_free(model);
@@ -2035,7 +2088,7 @@ void f_run_supervised_fine_tuning(const char *corpus_path, const char *source_mo
       bool chunk_mask[d_context];
       size_t step = 1;
       printf("loaded pre-trained model from '%s'\n", source_model_path);
-      for (size_t index_epoch = 0; index_epoch < number_epochs; ++index_epoch)
+      for (size_t index_epoch = 0; index_epoch < number_epochs; ++index_epoch) {
         for (size_t index_corpus = 0; (index_corpus + 1) < supervised_fine_tuning_length;) {
           /* find the end of this conversation: scan forward to <EOS> or end of stream */
           size_t index_conversation_end = index_corpus, chunk_size;
@@ -2076,7 +2129,10 @@ void f_run_supervised_fine_tuning(const char *corpus_path, const char *source_mo
                 f_adam_weight_update(model, optimizer_state,
                     (d_learning_rate * 0.1f /* we're learning much slower, as we don't want to break the existing model */), d_momentum_decay,
                     d_magnitude_decay, d_epsilon, d_weight_decay, step);
-                f_checkpoint_save(model, optimizer_state, step, destination_model_path);
+                /* only re-dump every d_iteration_save steps, same as pretraining: with d_model/d_number_layers now at 256/8 a checkpoint is an order of
+                 * magnitude bigger than before, and saving on every single gradient step made checkpoint I/O the dominant cost of fine-tuning */
+                if ((step % d_iteration_save) == 0)
+                  f_checkpoint_save(model, optimizer_state, step, destination_model_path);
                 f_matrix_free(model_forward);
               }
               ++step;
@@ -2084,6 +2140,9 @@ void f_run_supervised_fine_tuning(const char *corpus_path, const char *source_mo
           }
           index_corpus = (index_conversation_end + 1); /* advance to next conversation */
         }
+        /* unconditional save at the end of each epoch, so progress isn't lost if the epoch's last step doesn't land on a d_iteration_save boundary */
+        f_checkpoint_save(model, optimizer_state, step, destination_model_path);
+      }
       f_GPT_optimizer_state_free(optimizer_state);
     }
     f_GPT_model_free(model);
